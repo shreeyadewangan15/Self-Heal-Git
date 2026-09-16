@@ -24,11 +24,15 @@ def create_db_and_tables() -> None:
     SQLModel.metadata.create_all(engine)
 
 
+from app.watcher import start_event_driven_watcher, stop_event_driven_watcher
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
     create_db_and_tables()
+    start_event_driven_watcher()
     yield
+    stop_event_driven_watcher()
 
 
 # Guarantee tables exist in self_heal_git.db upon module import
@@ -57,3 +61,25 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(api_router)
 app.include_router(admin_router)
+
+
+@app.get("/", summary="Root Health & Service Info")
+def root_status():
+    return {
+        "status": "online",
+        "service": "Self-Heal Git API",
+        "version": "0.3.0",
+        "interactive_docs": "/docs",
+        "frontend_dashboard": "http://localhost:3000/dashboard",
+        "three_agent_pipeline": {
+            "benchmark_trigger": "POST /api/pipeline/benchmark",
+            "custom_run": "POST /api/pipeline/run",
+            "latest_trace": "GET /api/pipeline/latest-trace",
+            "agents": [
+                "Agent 1: Test Runner & CI Failure Interceptor",
+                "Agent 2: Stack Trace Diagnostic & Surgical Code Repair",
+                "Agent 3: Verification & Regression Agent (100% Pass)",
+            ],
+        },
+    }
+

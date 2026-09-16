@@ -4,9 +4,9 @@ import json
 import time
 import os
 import logging
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from pydantic import BaseModel
-from sqlmodel import Session, select
+from sqlmodel import Session, select, or_
 
 from .utils import verify_signature, extract_pr_metadata, process_pr
 from .config import settings, engine
@@ -25,6 +25,112 @@ class SimulateRequest(BaseModel):
     code_snippet: Optional[str] = None
     file_path: Optional[str] = "app/service.py"
     repo: Optional[str] = "tcet-opensource/quantum-core"
+
+
+def resolve_webhook_user(
+    session: Session,
+    repo_name: Optional[str],
+    author_login: Optional[str],
+    author_email: Optional[str],
+    configured_secret: Optional[str] = None,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Resolve user_id and repo_id for an incoming GitHub webhook PR.
+
+    Matching strategy:
+    1. Check if the repository exists in database. If so, get its id and owner (created_by_id).
+    2. Try matching user by exact email if author_email is present.
+    3. Try matching user by GitHub username/login against User email or full_name.
+    4. Try matching user via repository ownership (created_by_id).
+    5. Fallback: Assign to the primary repository owner or default active user instead of NULL.
+    """
+    repo_record = None
+    repo_id = None
+    repo_owner_id = None
+
+    if repo_name:
+        repo_record = session.exec(
+            select(Repository).where(Repository.full_name.ilike(repo_name))
+        ).first()
+        if repo_record:
+            repo_id = repo_record.id
+            repo_owner_id = repo_record.created_by_id
+
+    matched_user = None
+
+    # Step 1: Match by exact author email if provided
+    if author_email:
+        matched_user = session.exec(
+            select(User).where(User.email.ilike(author_email))
+        ).first()
+
+    # Step 2: Match by GitHub username/login against User fields
+    if not matched_user and author_login:
+        clean_login = author_login.strip()
+        matched_user = session.exec(
+            select(User).where(
+                or_(
+                    User.email.ilike(clean_login),
+                    User.email.ilike(f"{clean_login}@%"),
+                    User.email.ilike(f"%{clean_login}%"),
+                    User.full_name.ilike(f"%{clean_login}%"),
+                )
+            )
+        ).first()
+
+        # Partial alphanumeric match (e.g. shreeyadewangan15 -> shreeyadewangan in email)
+        if not matched_user:
+            alpha_login = "".join([c for c in clean_login if c.isalpha()]).lower()
+            if len(alpha_login) >= 4:
+                matched_user = session.exec(
+                    select(User).where(
+                        or_(
+                            User.email.ilike(f"%{alpha_login}%"),
+                            User.full_name.ilike(f"%{alpha_login}%"),
+                        )
+                    )
+                ).first()
+
+    # Step 3: Match using repository ownership if user not yet found
+    if not matched_user and repo_owner_id:
+        matched_user = session.get(User, repo_owner_id)
+
+    # Step 4: Fallback assignment: primary repository owner or default active user
+    assigned_user_id = None
+    if matched_user:
+        assigned_user_id = matched_user.id
+    elif repo_owner_id:
+        assigned_user_id = repo_owner_id
+    else:
+        # Prefer active DEVELOPER first, then any active user
+        default_user = session.exec(
+            select(User).where(User.is_active == True, User.role == UserRole.DEVELOPER).order_by(User.id.asc())
+        ).first()
+        if not default_user:
+            default_user = session.exec(
+                select(User).where(User.is_active == True).order_by(User.id.asc())
+            ).first()
+        if default_user:
+            assigned_user_id = default_user.id
+
+    # If repository record does not exist yet in DB, auto-register it so the repo is monitored and linked
+    if not repo_record and repo_name:
+        try:
+            repo_record = Repository(
+                full_name=repo_name,
+                webhook_secret=configured_secret or "whsec_tcet_auto",
+                is_active=True,
+                auto_commit_enabled=True,
+                created_by_id=assigned_user_id,
+            )
+            session.add(repo_record)
+            session.commit()
+            session.refresh(repo_record)
+            repo_id = repo_record.id
+        except Exception as exc:
+            session.rollback()
+            logger.warning("Could not auto-create Repository record for %s: %s", repo_name, exc)
+
+    return assigned_user_id, repo_id
 
 
 @router.post("/api/webhook/github")
@@ -73,15 +179,48 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
 
     metadata = extract_pr_metadata(payload)
     with Session(engine) as session:
-        record = PRRecord(
-            repo=metadata["repo"],
-            pr_number=metadata["pr_number"],
-            title=metadata["title"],
-            status="RECEIVED",
+        assigned_user_id, repo_id = resolve_webhook_user(
+            session=session,
+            repo_name=metadata.get("repo"),
+            author_login=metadata.get("author_username"),
+            author_email=metadata.get("author_email"),
+            configured_secret=configured_secret,
         )
-        session.add(record)
+
+        record = session.exec(
+            select(PRRecord).where(
+                PRRecord.repo == metadata["repo"],
+                PRRecord.pr_number == metadata["pr_number"],
+            )
+        ).first()
+
+        if not record:
+            record = PRRecord(
+                repo=metadata["repo"],
+                pr_number=metadata["pr_number"],
+                title=metadata["title"],
+                status="RECEIVED",
+                user_id=assigned_user_id,
+                repo_id=repo_id,
+            )
+            session.add(record)
+        else:
+            record.title = metadata["title"]
+            record.status = "RECEIVED"
+            if assigned_user_id and not record.user_id:
+                record.user_id = assigned_user_id
+            if repo_id and not record.repo_id:
+                record.repo_id = repo_id
+            session.add(record)
+
         session.commit()
-        logger.info("Stored PR record: %s#%s", metadata["repo"], metadata["pr_number"])
+        logger.info(
+            "Stored PR record: %s#%s (user_id=%s, repo_id=%s)",
+            metadata["repo"],
+            metadata["pr_number"],
+            assigned_user_id,
+            repo_id,
+        )
 
     background_tasks.add_task(process_pr, metadata)
     return JSONResponse(content={"detail": "Webhook received"}, status_code=200)
@@ -100,9 +239,13 @@ async def health_check():
 def get_my_feed(
     current_user: User = Depends(get_current_user),
 ):
-    """Return PR runs and telemetry associated with active repositories."""
+    """Return PR runs and telemetry associated with active repositories.
+    
+    - If user.role == 'ADMIN': return all PRs.
+    - If user.role != 'ADMIN' (DEVELOPER / standard user):
+      Return PRs where pr.user_id == current_user.id OR pr.repo matches any repository belonging to the user OR pr.user_id IS NULL.
+    """
     with Session(engine) as session:
-        # If ADMIN, show all accounts' data. If regular user, show ONLY that particular account's data.
         if current_user.role == UserRole.ADMIN:
             records = session.exec(select(PRRecord).order_by(PRRecord.timestamp.desc())).all()
         else:
@@ -115,13 +258,13 @@ def get_my_feed(
             conditions = [
                 (PRRecord.user_id == current_user.id),
                 (PRRecord.reviewed_by_id == current_user.id),
+                (PRRecord.user_id.is_(None)),  # unassigned incoming PRs from monitored repos
             ]
             if user_repo_ids:
                 conditions.append(PRRecord.repo_id.in_(user_repo_ids))
             if user_repo_names:
                 conditions.append(PRRecord.repo.in_(user_repo_names))
 
-            from sqlmodel import or_
             records = session.exec(
                 select(PRRecord).where(or_(*conditions)).order_by(PRRecord.timestamp.desc())
             ).all()
@@ -164,10 +307,39 @@ def get_my_feed(
 
 
 @router.get("/api/prs")
-def get_prs():
-    """Return all intercepted PR records and overall telemetry stats (public/compat)."""
+def get_prs(
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Return PR records and telemetry stats (public/compat).
+    
+    - If user.role == 'ADMIN' or unauthenticated legacy request: return all PRs.
+    - If user.role != 'ADMIN' (DEVELOPER / standard user):
+      Return PRs where pr.user_id == current_user.id OR pr.repo matches any repository belonging to the user OR pr.user_id IS NULL.
+    """
     with Session(engine) as session:
-        records = session.exec(select(PRRecord).order_by(PRRecord.timestamp.desc())).all()
+        if current_user and current_user.role != UserRole.ADMIN:
+            user_repos = session.exec(
+                select(Repository).where(Repository.created_by_id == current_user.id)
+            ).all()
+            user_repo_ids = [r.id for r in user_repos]
+            user_repo_names = [r.full_name for r in user_repos]
+
+            conditions = [
+                (PRRecord.user_id == current_user.id),
+                (PRRecord.reviewed_by_id == current_user.id),
+                (PRRecord.user_id.is_(None)),  # unassigned incoming PRs from monitored repos
+            ]
+            if user_repo_ids:
+                conditions.append(PRRecord.repo_id.in_(user_repo_ids))
+            if user_repo_names:
+                conditions.append(PRRecord.repo.in_(user_repo_names))
+
+            records = session.exec(
+                select(PRRecord).where(or_(*conditions)).order_by(PRRecord.timestamp.desc())
+            ).all()
+        else:
+            records = session.exec(select(PRRecord).order_by(PRRecord.timestamp.desc())).all()
+
         total = len(records)
         healed = sum(1 for r in records if r.status == "HEALED")
         analyzing = sum(1 for r in records if r.status in ("ANALYZING", "RECEIVED"))
@@ -212,9 +384,19 @@ def get_pr_diff(
         if not record:
             raise HTTPException(status_code=404, detail="PR record not found")
 
-        # Admin can view all; Developer can only view their own account's PR
+        # Admin can view all; Developer can view own PR, repository PR, or unassigned PR
         if current_user and current_user.role != UserRole.ADMIN:
-            if record.user_id and record.user_id != current_user.id and record.reviewed_by_id != current_user.id:
+            user_repos = session.exec(
+                select(Repository).where(Repository.created_by_id == current_user.id)
+            ).all()
+            user_repo_names = [r.full_name for r in user_repos]
+            user_repo_ids = [r.id for r in user_repos]
+
+            is_owner = (record.user_id == current_user.id or record.reviewed_by_id == current_user.id)
+            is_repo_owner = (record.repo_id in user_repo_ids or record.repo in user_repo_names)
+            is_unassigned = (record.user_id is None)
+
+            if not (is_owner or is_repo_owner or is_unassigned):
                 raise HTTPException(status_code=403, detail="Forbidden: You do not have permission to view another account's PR")
 
         issues = []
@@ -296,6 +478,48 @@ def approve_pr_patch(
             "status": record.status,
             "commit_sha": record.commit_sha,
             "approved_by": current_user.email,
+        }
+
+
+@router.delete("/api/prs/{pr_id}", summary="Delete a pull request record")
+def delete_pr_record(
+    pr_id: int,
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a pull request record.
+
+    Admins can delete any PR record.
+    Regular users can delete only PR records belonging to their account.
+    """
+    with Session(engine) as session:
+        record = session.get(PRRecord, pr_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="PR record not found")
+
+        # Non-admin user can only delete their own PR or PRs belonging to their repositories
+        if current_user.role != UserRole.ADMIN:
+            user_repos = session.exec(
+                select(Repository).where(Repository.created_by_id == current_user.id)
+            ).all()
+            user_repo_names = [r.full_name for r in user_repos]
+            user_repo_ids = [r.id for r in user_repos]
+
+            is_owner = (record.user_id == current_user.id or record.reviewed_by_id == current_user.id)
+            is_repo_owner = (record.repo_id in user_repo_ids or record.repo in user_repo_names)
+
+            if not (is_owner or is_repo_owner):
+                raise HTTPException(status_code=403, detail="Forbidden: You cannot delete another account's PR record")
+
+        pr_num = record.pr_number
+        repo_name = record.repo
+        session.delete(record)
+        session.commit()
+        logger.info("PR record #%s (%s, id=%s) deleted by %s", pr_num, repo_name, pr_id, current_user.email)
+
+        return {
+            "message": f"Pull Request #{pr_num} deleted successfully",
+            "id": pr_id,
+            "repo": repo_name,
         }
 
 
@@ -454,3 +678,47 @@ async def simulate_pr(
         "repo": metadata["repo"],
         "title": metadata["title"],
     }
+
+
+# ---------------------------------------------------------------------------
+# 3-Agent Event-Driven Self-Healing Pipeline Endpoints
+# ---------------------------------------------------------------------------
+from .watcher import run_healing_pipeline, get_latest_trace
+from .agents.orchestrator import VisualDiagnosticTrace
+
+
+@router.post("/api/pipeline/benchmark", summary="Trigger 3-Agent benchmark (Missing Comma + Indexing Error)")
+def trigger_benchmark():
+    """Trigger the event-driven 3-Agent self-healing pipeline benchmark.
+    
+    1. Agent 1 executes unit tests on code changes -> fails due to missing comma & indexing error.
+    2. Agent 2 intercepts the stack trace, diagnoses coding error, and rewrites offending lines on disk.
+    3. Agent 3 re-runs the tests to verify 100% pass rate.
+    Returns the clean visual diagnostic trace mapping exact failure, reasoning, and correction.
+    """
+    trace: VisualDiagnosticTrace = run_healing_pipeline()
+    return trace.model_dump()
+
+
+@router.post("/api/pipeline/run", summary="Run 3-Agent self-healing pipeline on specified targets")
+async def trigger_custom_pipeline(request: Request):
+    """Run the 3-Agent pipeline on custom or specified test/target files."""
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    test_target = body.get("test_target")
+    target_file = body.get("target_file")
+    trace: VisualDiagnosticTrace = run_healing_pipeline(test_target=test_target, target_file=target_file)
+    return trace.model_dump()
+
+
+@router.get("/api/pipeline/latest-trace", summary="Get the latest 3-Agent visual diagnostic trace")
+def fetch_latest_trace():
+    """Retrieve the most recent visual diagnostic trace."""
+    trace = get_latest_trace()
+    if not trace:
+        trace = run_healing_pipeline()
+    return trace.model_dump()
+

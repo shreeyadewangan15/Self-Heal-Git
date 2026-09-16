@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Dict, Any, Optional
 from fastapi import BackgroundTasks
-from sqlmodel import Session
+from sqlmodel import Session, select
 from .config import settings, engine
 from .models import PRRecord
 from .agent import diagnose_and_heal, verify_patch_syntax, HealingReport, PatchAction, CodeIssue
@@ -43,18 +43,29 @@ def extract_pr_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     Expected keys are present when the event is a pull request action (opened,
     synchronize, reopened). The function returns a dictionary containing:
-    ``repo``, ``pr_number``, ``title``, ``head_branch``, ``base_branch``, and
-    ``head_sha``.
+    ``repo``, ``pr_number``, ``title``, ``head_branch``, ``base_branch``,
+    ``head_sha``, ``author_username``, and ``author_email``.
     """
-    repository = payload.get("repository", {})
-    pull = payload.get("pull_request", {})
+    repository = payload.get("repository", {}) if isinstance(payload.get("repository"), dict) else {}
+    pull = payload.get("pull_request", {}) if isinstance(payload.get("pull_request"), dict) else {}
+    sender = payload.get("sender", {}) if isinstance(payload.get("sender"), dict) else {}
+    user_obj = pull.get("user", {}) if isinstance(pull.get("user"), dict) else {}
+
+    author_username = user_obj.get("login") or sender.get("login")
+    author_email = (
+        user_obj.get("email")
+        or (pull.get("head", {}).get("user", {}).get("email") if isinstance(pull.get("head"), dict) and isinstance(pull.get("head", {}).get("user"), dict) else None)
+    )
+
     return {
         "repo": repository.get("full_name"),
         "pr_number": pull.get("number"),
         "title": pull.get("title"),
-        "head_branch": pull.get("head", {}).get("ref"),
-        "base_branch": pull.get("base", {}).get("ref"),
-        "head_sha": pull.get("head", {}).get("sha"),
+        "head_branch": pull.get("head", {}).get("ref") if isinstance(pull.get("head"), dict) else None,
+        "base_branch": pull.get("base", {}).get("ref") if isinstance(pull.get("base"), dict) else None,
+        "head_sha": pull.get("head", {}).get("sha") if isinstance(pull.get("head"), dict) else None,
+        "author_username": author_username,
+        "author_email": author_email,
     }
 
 
@@ -74,9 +85,11 @@ def process_pr(metadata: Dict[str, Any]) -> None:
     # 1. Update status to ANALYZING
     # ---------------------------------------------------
     with Session(engine) as session:
-        record = session.query(PRRecord).filter(
-            PRRecord.repo == metadata["repo"],
-            PRRecord.pr_number == metadata["pr_number"]
+        record = session.exec(
+            select(PRRecord).where(
+                PRRecord.repo == metadata["repo"],
+                PRRecord.pr_number == metadata["pr_number"]
+            )
         ).first()
         if record:
             record.status = "ANALYZING"
@@ -98,8 +111,10 @@ def process_pr(metadata: Dict[str, Any]) -> None:
         final_status = "FAILED"
         # update status and exit
         with Session(engine) as session:
-            rec = session.query(PRRecord).filter(
-                PRRecord.repo == metadata["repo"], PRRecord.pr_number == metadata["pr_number"]
+            rec = session.exec(
+                select(PRRecord).where(
+                    PRRecord.repo == metadata["repo"], PRRecord.pr_number == metadata["pr_number"]
+                )
             ).first()
             if rec:
                 rec.status = final_status
@@ -122,8 +137,10 @@ def process_pr(metadata: Dict[str, Any]) -> None:
         logger.exception("LLM diagnostic failed: %s", exc)
         final_status = "FAILED"
         with Session(engine) as session:
-            rec = session.query(PRRecord).filter(
-                PRRecord.repo == metadata["repo"], PRRecord.pr_number == metadata["pr_number"]
+            rec = session.exec(
+                select(PRRecord).where(
+                    PRRecord.repo == metadata["repo"], PRRecord.pr_number == metadata["pr_number"]
+                )
             ).first()
             if rec:
                 rec.status = final_status
@@ -146,8 +163,10 @@ def process_pr(metadata: Dict[str, Any]) -> None:
         final_status = "FAILED"
         post_pr_comment(metadata["repo"], metadata["pr_number"], report, commit_sha=None)
         with Session(engine) as session:
-            rec = session.query(PRRecord).filter(
-                PRRecord.repo == metadata["repo"], PRRecord.pr_number == metadata["pr_number"]
+            rec = session.exec(
+                select(PRRecord).where(
+                    PRRecord.repo == metadata["repo"], PRRecord.pr_number == metadata["pr_number"]
+                )
             ).first()
             if rec:
                 rec.status = final_status
@@ -174,8 +193,10 @@ def process_pr(metadata: Dict[str, Any]) -> None:
         final_status = "FAILED"
         post_pr_comment(metadata["repo"], metadata["pr_number"], report, commit_sha=None)
         with Session(engine) as session:
-            rec = session.query(PRRecord).filter(
-                PRRecord.repo == metadata["repo"], PRRecord.pr_number == metadata["pr_number"]
+            rec = session.exec(
+                select(PRRecord).where(
+                    PRRecord.repo == metadata["repo"], PRRecord.pr_number == metadata["pr_number"]
+                )
             ).first()
             if rec:
                 rec.status = final_status
@@ -197,8 +218,10 @@ def process_pr(metadata: Dict[str, Any]) -> None:
     # ---------------------------------------------------
     final_status = "HEALED"
     with Session(engine) as session:
-        rec = session.query(PRRecord).filter(
-            PRRecord.repo == metadata["repo"], PRRecord.pr_number == metadata["pr_number"]
+        rec = session.exec(
+            select(PRRecord).where(
+                PRRecord.repo == metadata["repo"], PRRecord.pr_number == metadata["pr_number"]
+            )
         ).first()
         if rec:
             rec.status = final_status
