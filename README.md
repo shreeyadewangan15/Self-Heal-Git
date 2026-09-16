@@ -200,6 +200,3 @@ tests/test_webhook_delivery.py ...                                       [100%]
 
 ---
 
-## 📄 License
-
-This project is licensed under the [MIT License](LICENSE).
